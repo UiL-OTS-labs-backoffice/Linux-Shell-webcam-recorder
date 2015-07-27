@@ -1,0 +1,211 @@
+#!/bin/sh
+# Flags:
+#	-r = Resolution. Options: hd, fhd, sd (default hq)
+#	-p = Preview.
+
+# VIDEO DEVICE
+VIDEO_DEVICE=/dev/video0
+
+if [ ! -e /dev/video0 ]; then
+	zenity --error \
+		--title="Video capture device not found" \
+		--text="No video capture device could be found.\nPlease connect a webcam and try again." 
+	exit
+fi
+
+#Resolution settings
+FHD=width=1920:height=1080	# Full HD (1080p)
+HD=width=1280:height=720	# HD ready (720p)
+HQ=width=800:height=600		# High Quality
+SD=width=640:height=480		# Standard Definition
+
+# Flag variables
+widescreen=$SD		# Used for preview
+res=$HQ			# Resolution (default HQ)
+preview=false		# Show preview during recording?
+
+# Check for flags
+while getopts rp option
+do
+        case "${option}" in
+		# Check for custom resolution
+                r) ARG1=$(zenity --list \
+			--title="Video Recorder: Choose resolution" \
+			--text="The option ${OPTARG} is not available.\nPlease choose from the available modes:" \
+			--width=500 \
+			--height=240 \
+			--radiolist \
+			--column="" --column="flag" --column="Image quality" --column="Resolution" \
+				FALSE sd "Standard Definition" "640 * 480 px (4:3)" \
+				TRUE hq "High Quality" "800 * 600 px (4:3)" \
+				FALSE hd "HD-ready" "1280 * 720 px (16:9 / widescreen)" \
+				FALSE fhd "Full-HD" "1920 * 1080 px 16:9 / widescreen)"); ;;
+		# Check for preview during recording
+		p) zenity --question \
+			--title="Video Recorder" \
+			--text="Do you want a live preview during recording?\nThis might make your computer slower.\n\nYou will still see a live preview before recording starts if you click 'no'. However, this window will disappear once you start recording." \
+			--height=50 \
+			--width=500
+			ARG2=$?
+	esac
+done
+
+# If flag for resolution i set, check the 
+case $ARG1 in
+	hd) res=$HD
+		widescreen=width=852:height=480 ;;
+	fhd) res=$FHD 
+		widescreen=width=852:height=480	;;
+	hq) res=$HQ  ;;
+	sd) res=$SD ;;
+	"") ;;
+	*) zenity --error \
+		--title="Video Recorder" \
+		--text="Resolution could not be set.\nDefault resolution will be used" 
+esac 
+
+# Calculate the scale factor for the transcoding of the preview
+# CURRENTLY NOT WORKING!
+screenHeight=$(xrandr --current | grep '*' | uniq | awk '{print $1}' | cut -d 'x' -f2)
+displayHeight=$(echo "$res" | cut -d '=' -f3)
+wantedHeight=$((screenHeight / 2))
+cropFactor=$(echo "$wantedHeight  $displayHeight" | awk '{printf "%.1f", $1/$2}' )
+
+# Set the preview variable
+case $ARG2 in
+	0) preview=true ;;
+	1)  ;;
+	"") ;;
+	*) zenity --error \
+		--title="Video recorder" \
+		--text="Something went wrong. Live preview could not be enabled." ;; 
+esac
+
+# The current date will make the default file name
+DATE=`date +%Y%m%d-%H%M%S`
+
+# If the video device is not found, an error is thrown and
+# the program exits
+case $? in
+	0)	;;
+	*)	zenity --error \
+		--title="Video Recorder" \
+		--text="Unable to select video device inputs."
+		exit;;
+esac
+
+# I really don't know the point of this
+if [ -d videos ]; then
+	cd videos > /dev/null
+fi
+
+# Allow user to select a filename and a folder where
+# the file should be saved.
+# All files will be saved as .mp4, as that supports H.264 
+# codec
+FILE=`zenity --file-selection \
+	--title="Video Recorder" \
+	--save \
+	--confirm-overwrite \
+	--file-filter=*.mp4 \
+	--filename="$DATE.mp4"`
+case $? in
+	0)	;;
+	*)	exit;;
+esac
+
+# Open a new preview window
+cvlc v4l2://$VIDEO_DEVICE:$widescreen --sout '#transcode{codec=mp4v,vb=200,fps=20}:display' > /dev/null &
+PROCESSID=$!
+
+# Set the recording prompt text
+recordingPrompt="Live preview is now playing.\n\nTHE SYSTEM IS NOT YET RECORDING\n\nPress 'start' to start recording."
+if ! $preview ; then	# If live preview is disabled
+	recordingPrompt="$recordingPrompt\nOnce you press start, the live preview window will disappear."
+fi
+
+# Prompt for the user to start the recording
+zenity --question \
+	--title="Video Recorder" \
+	--text="$recordingPrompt" \
+	--ok-label=Start \
+	--width=500 \
+	--height=100 \
+	--no-wrap \
+	--cancel-label=Cancel
+case $? in
+	0)	;;
+	*)	kill $PROCESSID	
+		exit;;
+esac
+
+# Creates a folder in the temp folder where the temp video
+# file is then saved
+mkdir -p /tmp/videos
+TEMPFILE=/tmp/videos/$DATE.mp4
+
+# Terminate current live stream
+kill $PROCESSID
+sleep 1
+
+if ! $preview; then
+	# Start VLC with the right settings and begin recording
+	cvlc v4l2://$VIDEO_DEVICE:$res --sout '#standard{access=file,mux=ts,dst='$TEMPFILE'}' > /dev/null &
+else
+	# Or start a duplicated stream
+	# Transcode doesn work with duplicating a stream
+	cvlc v4l2://$VIDEO_DEVICE:$res --sout '#duplicate{dst=standard{access=file,mux=ts,dst='$TEMPFILE'},dst="transcode{vcodec=mp4v,vb=10,fps=20,scale='$cropFactor'}:display"}' & 
+fi 
+
+PROCESSID=$!
+while true; do
+	zenity --question \
+		--title="Video Recorder" \
+		--text="Video recording running." \
+		--ok-label=Finish \
+		--cancel-label=Abort
+	case $? in
+		0)	kill $PROCESSID
+			sleep 1
+			if [ -e $TEMPFILE ]; then
+				( echo 1
+				cp -r $TEMPFILE $FILE &
+				sourceSize=$(stat --format=%s $TEMPFILE)
+				while true ; do
+					while ! [ -e $FILE ]; do
+						sleep 0.2
+					done
+					progress=$(( $(stat --format="%s" $FILE)* 100 / $sourceSize ))
+					if [ $progress = "100" ]; then
+						break
+					else
+						echo $progress
+					fi
+				done ) | zenity --progress \
+								  --title="Saving file..." \
+								  --text="Saving file to $FILE" \
+								  --percentage=0
+					rm $TEMPFILE
+			else
+				zenity --error \
+				--title="Video Recorder" \
+				--text="Temp file could not be recovered. Recording failed.\n Please check $TEMPFILE to see if you can recover it, or ask lab support to help you\n(do not shut down your computer while you haven't recovered the recording!)"
+			fi
+			exit ;;
+	esac
+
+	
+	zenity --question \
+		--title="Video Recorder" \
+		--text="Are you sure to abort the recording?"
+	case $? in
+		0)	kill $PROCESSID
+			if [ -e $TMPVIDEO ]; then
+				mv $TMPVIDEO "$FILE".aborted
+			fi
+			zenity --info \
+				--title="Video Recorder: Aborted" \
+				--text="Video recording aborted."
+			exit;;
+	esac
+done
